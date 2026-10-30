@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -19,63 +18,24 @@ import (
 	"github.com/vflame6/leaker/utils"
 )
 
-// DarkEye queries the two public DarkEye APIs in a single source:
+// Shared code for the two DarkEye sources (darkeye.io), each with its own key
+// and its own row in the provider config:
 //
-//   - Have I Been Ransomed? (haveibeenransom.com): ransomware leak-site posts and
-//     data breaches for a domain.
-//   - Breach House (breach.house): ransomware victims, data breaches, leads and
-//     stealer records matching a domain.
+//   - HIBR (hibr.go): Have I Been Ransomed? (haveibeenransom.com), ransomware
+//     leak-site posts and data breaches for a domain.
+//   - BreachHouse (breachhouse.go): Breach House (breach.house), ransomware
+//     victims, data breaches, leads and stealer records matching a domain.
 //
-// Each product has its own API key. Either one is enough. Only listing metadata
-// is returned (title, website, group, country, date); leaked records, proof
-// files and leak-site or download URLs are never read from the responses.
-//
-// Keys are configured with a product prefix, one list entry per key:
-//
-//	darkeye: ["hibr:YOUR_HIBR_KEY", "breachhouse:YOUR_BREACH_HOUSE_KEY"]
-type DarkEye struct {
-	hibrKeys []string
-	bhKeys   []string
-
-	// hibrBaseURL and breachHouseBaseURL override the API roots (tests only).
-	hibrBaseURL        string
-	breachHouseBaseURL string
-	// noDelay disables the pause between requests (tests only).
-	noDelay bool
-	// maxPages overrides darkEyeHIBRMaxPages when set (tests only).
-	maxPages int
-}
+// Only listing metadata is returned (title, website, group, country, date);
+// leaked records, proof files and leak-site or download URLs are never read
+// from the responses.
 
 const (
-	darkEyeHIBRBaseURL        = "https://haveibeenransom.com"
-	darkEyeBreachHouseBaseURL = "https://breach.house/api/v1"
-
-	darkEyeHIBRName        = "Have I Been Ransomed?"
-	darkEyeBreachHouseName = "Breach House"
-
-	darkEyeHIBRPrefix        = "hibr"
-	darkEyeBreachHousePrefix = "breachhouse"
-
-	// Every HIBR page counts as one request against the key's quota, so the
-	// number of pages fetched per lookup is capped.
-	darkEyeHIBRMaxPages = 5
-	// Max results per category for one Breach House search (the API maximum is 200).
-	darkEyeBreachHouseLimit = 25
-
 	// Upper bound for a response body, as a guard against unexpected payloads.
 	darkEyeMaxBodySize = 8 << 20
 	// Upper bound for a single metadata value.
 	darkEyeMaxFieldRunes = 200
 )
-
-// Breach House returns one list per category in this order.
-var darkEyeBreachHouseCategories = []string{"ransomware", "breaches", "leads", "stealers"}
-
-// darkEyeHIBRCategories maps the HIBR leak_type values to the category names.
-var darkEyeHIBRCategories = map[string]string{
-	"ransomware_leak":    "ransomware",
-	"traditional_breach": "breaches",
-}
 
 // The APIs treat * and ? as wildcards, so only plain domain names are queried.
 var darkEyeDomainRegex = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
@@ -114,69 +74,60 @@ type darkEyeItem struct {
 	Discovered darkEyeText `json:"discovered"`
 }
 
-type darkEyeHIBRPage struct {
-	Sources    []json.RawMessage `json:"sources"`
-	Results    []json.RawMessage `json:"results"`
-	HasNext    *bool             `json:"has_next"`
-	Pagination struct {
-		HasNext bool `json:"has_next"`
-	} `json:"pagination"`
-}
-
-// darkEyeRecord is a parsed record together with its product and category.
+// darkEyeRecord is a parsed record together with its category.
 type darkEyeRecord struct {
-	product  string
 	category string
 	id       string
 	item     darkEyeItem
 }
 
-func (s *DarkEye) Run(ctx context.Context, target string, scanType ScanType, session *Session) <-chan Result {
+// darkEyeLookup describes one DarkEye source for darkEyeRun.
+type darkEyeLookup struct {
+	source  string // source name, e.g. "hibr"
+	product string // product name used in messages
+	keys    []string
+	// keyedByDomain is true when the API is keyed by domain, so every record
+	// belongs to the searched domain even without a website of its own.
+	keyedByDomain bool
+	fetch         func(ctx context.Context, apiKey, domain string) ([]darkEyeRecord, error)
+}
+
+// darkEyeRun runs one DarkEye lookup. Records read before a failure are still
+// returned, followed by the failure as an error result.
+func darkEyeRun(ctx context.Context, l darkEyeLookup, target string, scanType ScanType) <-chan Result {
 	results := make(chan Result)
 
 	go func() {
 		defer close(results)
 
-		// DarkEye is searched by domain only.
+		// DarkEye sources are searched by domain only.
 		if scanType != TypeDomain {
 			return
 		}
 
-		hibrKey := utils.PickRandom(s.hibrKeys, s.Name(), s.NeedsKey())
-		bhKey := utils.PickRandom(s.bhKeys, s.Name(), s.NeedsKey())
-		if hibrKey == "" && bhKey == "" {
+		apiKey := utils.PickRandom(l.keys, l.source, true)
+		if apiKey == "" {
 			return
 		}
 
 		domain, ok := normalizeDarkEyeDomain(target)
 		if !ok {
-			send(ctx, results, Result{Source: s.Name(), Error: fmt.Errorf("DarkEye needs a plain domain name, got %q", target)})
+			send(ctx, results, Result{Source: l.source, Error: fmt.Errorf("%s needs a plain domain name, got %q", l.product, target)})
 			return
 		}
 
-		// Each product is queried on its own: when one fails, the records of the
-		// other one are still returned and the failure is reported as an error result.
-		if hibrKey != "" {
-			records, err := s.fetchHIBR(ctx, session, hibrKey, domain)
-			if !s.emit(ctx, results, domain, records) {
-				return
+		records, err := l.fetch(ctx, apiKey, domain)
+		for _, record := range records {
+			r, ok := darkEyeRecordToResult(l.source, l.keyedByDomain, record, domain)
+			if !ok {
+				continue
 			}
-			if err != nil && (ctx.Err() != nil || !send(ctx, results, Result{Source: s.Name(), Error: err})) {
+			if !send(ctx, results, r) {
 				return
 			}
 		}
-
-		if bhKey != "" {
-			if hibrKey != "" && !s.pause(ctx) {
-				return
-			}
-			records, err := s.fetchBreachHouse(ctx, session, bhKey, domain)
-			if !s.emit(ctx, results, domain, records) {
-				return
-			}
-			if err != nil && ctx.Err() == nil {
-				send(ctx, results, Result{Source: s.Name(), Error: err})
-			}
+		if err != nil && ctx.Err() == nil {
+			send(ctx, results, Result{Source: l.source, Error: err})
 		}
 	}()
 
@@ -193,179 +144,30 @@ func send(ctx context.Context, results chan<- Result, r Result) bool {
 	}
 }
 
-// emit converts the records to results and sends them.
-func (s *DarkEye) emit(ctx context.Context, results chan<- Result, domain string, records []darkEyeRecord) bool {
-	for _, record := range records {
-		r, ok := s.recordToResult(record, domain)
-		if !ok {
-			continue
-		}
-		if !send(ctx, results, r) {
-			return false
-		}
-	}
-	return true
-}
-
-// pause waits between two requests to respect the rate limit.
-func (s *DarkEye) pause(ctx context.Context) bool {
-	if s.noDelay {
+// darkEyePause waits between two requests to respect the rate limit.
+func darkEyePause(ctx context.Context, rateLimit int, noDelay bool) bool {
+	if noDelay {
 		return ctx.Err() == nil
 	}
 	select {
 	case <-ctx.Done():
 		return false
-	case <-time.After(time.Second / time.Duration(s.RateLimit())):
+	case <-time.After(time.Second / time.Duration(rateLimit)):
 		return true
 	}
 }
 
-// fetchHIBR reads up to darkEyeHIBRMaxPages pages of Have I Been Ransomed? records.
-// Records read before a failure are returned together with the error.
-func (s *DarkEye) fetchHIBR(ctx context.Context, session *Session, apiKey, domain string) ([]darkEyeRecord, error) {
-	var records []darkEyeRecord
-	seen := make(map[string]struct{})
-
-	maxPages := darkEyeHIBRMaxPages
-	if s.maxPages > 0 {
-		maxPages = s.maxPages
-	}
-
-	for page := 1; page <= maxPages; page++ {
-		if page > 1 && !s.pause(ctx) {
-			return records, ctx.Err()
-		}
-
-		endpoint := s.hibrRoot() + "/api/metadata/domain/" + url.PathEscape(domain)
-		if page > 1 {
-			endpoint += "/" + strconv.Itoa(page)
-		}
-
-		body, err := s.get(ctx, session, darkEyeHIBRName, endpoint, apiKey)
-		if err != nil {
-			return records, err
-		}
-
-		var data darkEyeHIBRPage
-		if err := json.Unmarshal(body, &data); err != nil {
-			return records, fmt.Errorf("%s returned an invalid response", darkEyeHIBRName)
-		}
-
-		// The API returns "sources"; its documentation shows "results".
-		raw := data.Sources
-		if len(raw) == 0 {
-			raw = data.Results
-		}
-		for _, entry := range raw {
-			var item darkEyeItem
-			if err := json.Unmarshal(entry, &item); err != nil {
-				continue
-			}
-			// A leak indexed while paging is repeated on a later page.
-			id := strings.TrimSpace(string(item.IDSource))
-			if id == "" {
-				id = strings.TrimSpace(string(item.ID))
-			}
-			if id != "" {
-				if _, dup := seen[id]; dup {
-					continue
-				}
-				seen[id] = struct{}{}
-			}
-			leakType := strings.TrimSpace(string(item.LeakType))
-			category, known := darkEyeHIBRCategories[leakType]
-			if !known {
-				category = darkEyeClean(leakType)
-			}
-			records = append(records, darkEyeRecord{product: darkEyeHIBRName, category: category, id: id, item: item})
-		}
-
-		// A page can be short or even empty and still have a next page.
-		hasNext := data.Pagination.HasNext
-		if data.HasNext != nil {
-			hasNext = *data.HasNext
-		}
-		if !hasNext {
-			return records, nil
-		}
-		if page == maxPages {
-			logger.Debugf("DarkEye reached the Have I Been Ransomed? page cap [%d] with more results available", maxPages)
-		}
-	}
-
-	return records, nil
-}
-
-// fetchBreachHouse runs one cross-source search on Breach House.
-func (s *DarkEye) fetchBreachHouse(ctx context.Context, session *Session, apiKey, domain string) ([]darkEyeRecord, error) {
-	q := url.Values{}
-	q.Set("q", domain)
-	q.Set("limit", strconv.Itoa(darkEyeBreachHouseLimit))
-	endpoint := s.breachHouseRoot() + "/search?" + q.Encode()
-
-	body, err := s.get(ctx, session, darkEyeBreachHouseName, endpoint, apiKey)
-	if err != nil {
-		return nil, err
-	}
-
-	var data map[string]json.RawMessage
-	if err := json.Unmarshal(body, &data); err != nil || data == nil {
-		return nil, fmt.Errorf("%s returned an invalid response", darkEyeBreachHouseName)
-	}
-
-	var records []darkEyeRecord
-	for _, category := range darkEyeBreachHouseCategories {
-		entries := darkEyeBreachHouseEntries(data[category])
-		if len(entries) >= darkEyeBreachHouseLimit {
-			logger.Debugf("DarkEye reached the Breach House limit [%d] for %s", darkEyeBreachHouseLimit, category)
-		}
-		for _, entry := range entries {
-			var item darkEyeItem
-			if err := json.Unmarshal(entry, &item); err != nil {
-				continue
-			}
-			id := strings.TrimSpace(string(item.VictimID))
-			if id == "" {
-				id = strings.TrimSpace(string(item.ID))
-			}
-			records = append(records, darkEyeRecord{product: darkEyeBreachHouseName, category: category, id: id, item: item})
-		}
-	}
-	return records, nil
-}
-
-// darkEyeBreachHouseEntries returns the items of one Breach House category,
-// which is either a plain list or an object with a "results" list.
-func darkEyeBreachHouseEntries(raw json.RawMessage) []json.RawMessage {
-	if len(raw) == 0 {
-		return nil
-	}
-	var list []json.RawMessage
-	if err := json.Unmarshal(raw, &list); err == nil {
-		return list
-	}
-	var wrapped struct {
-		Results []json.RawMessage `json:"results"`
-	}
-	if err := json.Unmarshal(raw, &wrapped); err == nil {
-		return wrapped.Results
-	}
-	return nil
-}
-
-// redact removes every configured API key from a message.
-func (s *DarkEye) redact(msg string) string {
-	for _, keys := range [][]string{s.hibrKeys, s.bhKeys} {
-		for _, key := range keys {
-			msg = strings.ReplaceAll(msg, key, "[redacted]")
-		}
+// darkEyeRedact removes every configured API key from a message.
+func darkEyeRedact(msg string, keys []string) string {
+	for _, key := range keys {
+		msg = strings.ReplaceAll(msg, key, "[redacted]")
 	}
 	return msg
 }
 
-// get performs an authenticated GET request and returns the response body.
+// darkEyeGet performs an authenticated GET request and returns the response body.
 // Errors never include the API key or the response body.
-func (s *DarkEye) get(ctx context.Context, session *Session, product, endpoint, apiKey string) ([]byte, error) {
+func darkEyeGet(ctx context.Context, session *Session, product, endpoint, apiKey string, keys []string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("%s request could not be created", product)
@@ -373,13 +175,13 @@ func (s *DarkEye) get(ctx context.Context, session *Session, product, endpoint, 
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Accept", "application/json")
 
-	logger.Debugf("Sending a request in DarkEye source to %s", product)
+	logger.Debugf("Sending a request to %s", product)
 	resp, err := session.Client.Do(req)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		return nil, fmt.Errorf("%s request failed: %s", product, s.redact(err.Error()))
+		return nil, fmt.Errorf("%s request failed: %s", product, darkEyeRedact(err.Error(), keys))
 	}
 	defer session.DiscardHTTPResponse(resp)
 
@@ -390,7 +192,7 @@ func (s *DarkEye) get(ctx context.Context, session *Session, product, endpoint, 
 		}
 		return nil, fmt.Errorf("%s response could not be read", product)
 	}
-	logger.Debugf("Response from DarkEye source (%s): status code [%d], size [%d]", product, resp.StatusCode, len(body))
+	logger.Debugf("Response from %s: status code [%d], size [%d]", product, resp.StatusCode, len(body))
 
 	switch resp.StatusCode {
 	case http.StatusOK:
@@ -404,14 +206,14 @@ func (s *DarkEye) get(ctx context.Context, session *Session, product, endpoint, 
 	}
 }
 
-// recordToResult maps a record to a Result that carries listing metadata only.
+// darkEyeRecordToResult maps a record to a Result that carries listing metadata only.
 //
 // Results that do not mention the searched domain are dropped by the default
 // result filter. The HIBR endpoint is keyed by domain, so its records are tied to
 // the domain even when the record has no website of its own: URL then holds the
 // searched domain. Breach House runs a free-text search, so its records keep their
 // own website and are filtered like any other result.
-func (s *DarkEye) recordToResult(record darkEyeRecord, domain string) (Result, bool) {
+func darkEyeRecordToResult(source string, keyedByDomain bool, record darkEyeRecord, domain string) (Result, bool) {
 	item := record.item
 
 	website := darkEyeClean(string(item.Website))
@@ -424,11 +226,11 @@ func (s *DarkEye) recordToResult(record darkEyeRecord, domain string) (Result, b
 	}
 
 	r := Result{
-		Source:   s.Name(),
+		Source:   source,
 		Database: title,
 		URL:      website,
 	}
-	if record.product == darkEyeHIBRName && !strings.Contains(strings.ToLower(website), domain) {
+	if keyedByDomain && !strings.Contains(strings.ToLower(website), domain) {
 		r.URL = domain
 		if website != "" {
 			r.SetExtra("website", website)
@@ -438,7 +240,6 @@ func (s *DarkEye) recordToResult(record darkEyeRecord, domain string) (Result, b
 		return Result{}, false
 	}
 
-	r.SetExtra("product", record.product)
 	if record.category != "" {
 		r.SetExtra("category", record.category)
 	}
@@ -506,62 +307,4 @@ func darkEyeDate(value string) string {
 		return ""
 	}
 	return day
-}
-
-func (s *DarkEye) hibrRoot() string {
-	if s.hibrBaseURL != "" {
-		return strings.TrimRight(s.hibrBaseURL, "/")
-	}
-	return darkEyeHIBRBaseURL
-}
-
-func (s *DarkEye) breachHouseRoot() string {
-	if s.breachHouseBaseURL != "" {
-		return strings.TrimRight(s.breachHouseBaseURL, "/")
-	}
-	return darkEyeBreachHouseBaseURL
-}
-
-func (s *DarkEye) Name() string {
-	return "darkeye"
-}
-
-func (s *DarkEye) UsesKey() bool {
-	return true
-}
-
-func (s *DarkEye) NeedsKey() bool {
-	return true
-}
-
-// AddApiKeys accepts keys prefixed with the product they belong to:
-// "hibr:KEY" for Have I Been Ransomed? and "breachhouse:KEY" for Breach House.
-// One of the two is enough.
-func (s *DarkEye) AddApiKeys(keys []string) {
-	for _, key := range keys {
-		idx := strings.Index(key, ":")
-		if idx < 0 {
-			logger.Warnf("DarkEye: invalid key format, expected %s:API_KEY or %s:API_KEY", darkEyeHIBRPrefix, darkEyeBreachHousePrefix)
-			continue
-		}
-		prefix := strings.ToLower(strings.TrimSpace(key[:idx]))
-		value := strings.TrimSpace(key[idx+1:])
-		if value == "" {
-			logger.Warnf("DarkEye: empty key ignored")
-			continue
-		}
-		switch prefix {
-		case darkEyeHIBRPrefix:
-			s.hibrKeys = append(s.hibrKeys, value)
-		case darkEyeBreachHousePrefix:
-			s.bhKeys = append(s.bhKeys, value)
-		default:
-			logger.Warnf("DarkEye: unknown key prefix, expected %s or %s", darkEyeHIBRPrefix, darkEyeBreachHousePrefix)
-		}
-	}
-}
-
-// RateLimit is a conservative default (one request per second), not a documented limit.
-func (s *DarkEye) RateLimit() int {
-	return 1
 }
